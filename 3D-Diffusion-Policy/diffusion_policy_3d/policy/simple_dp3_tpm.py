@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers import DDIMScheduler
 from termcolor import cprint
 import copy
 import time
@@ -18,14 +19,49 @@ from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
 from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
 
+from torch.distributions.beta import Beta
+
+class TimePredictionModele(nn.Module):
+    def __init__(self,
+                 input_dim=1280,
+                 time_embed_dim=256,
+                 hidden_dim=512,
+                 output_dim=2):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_dim,hidden_dim,kernel_size=1)
+        self.conv2 = nn.Conv1d(hidden_dim,hidden_dim//2,kernel_size=1)
+        self.time_step = nn.Sequential(
+            nn.Linear(time_embed_dim,hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim,hidden_dim)
+        )
+        self.fc = nn.Linear(hidden_dim//2,output_dim)
+
+    def forward(self,features,time_embed):
+        #features:(B,1280,T),time_embed:(B,256)
+        x=F.relu(self.conv1(features)) #(B,512,T)
+        #融入时间步嵌入
+        time_scale = self.time_step(time_embed).unsqueeze(-1) #(B,512,1)
+        x=x*time_scale #广播到(B,512,T)
+        x=F.relu(self.conv2(x)) #(B,256,T)
+        x=torch.mean(x,dim=2) #(B,256)
+        ab=self.fc(x) #(B,2)
+        #计算beta分布
+        a,b =ab[:,0],ab[:,1]
+        alpha = 1+torch.exp(a)
+        beta = 1+torch.exp(b)
+        r_n = Beta(alpha,beta).sample() #(B,)
+        return r_n,(alpha,beta)
+
 class SimpleDP3(BasePolicy):
     def __init__(self, 
             shape_meta: dict,
-            noise_scheduler: DDPMScheduler,
+            noise_scheduler: DDIMScheduler,
             horizon, 
             n_action_steps, 
             n_obs_steps,
-            num_inference_steps=None,
+            num_inference_steps=None, #10 #原始去噪推理步数
+            max_inference_steps=10, #tpm最大推理步数
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
             down_dims=(256,512,1024),
@@ -40,6 +76,7 @@ class SimpleDP3(BasePolicy):
             use_pc_color=False,
             pointnet_type="pointnet",
             pointcloud_encoder_cfg=None,
+            tpm_hidden_dim=512,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -100,6 +137,14 @@ class SimpleDP3(BasePolicy):
             use_up_condition=use_up_condition,
         )
 
+        #初始化tpm
+        self.tpm = TimePredictionModele(
+            input_dim=down_dims[0]+down_dims[-1],
+            time_embed_dim=diffusion_step_embed_dim,
+            hidden_dim=tpm_hidden_dim,
+            output_dim=2
+        )
+
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
@@ -122,6 +167,7 @@ class SimpleDP3(BasePolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
         self.kwargs = kwargs
+        self.max_inference_steps = max_inference_steps
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -141,30 +187,58 @@ class SimpleDP3(BasePolicy):
             ):
         model = self.model
         scheduler = self.noise_scheduler
-
+        tpm=self.tpm
 
         trajectory = torch.randn(
             size=condition_data.shape, 
             dtype=condition_data.dtype,
             device=condition_data.device)
 
-        # set step values
-        scheduler.set_timesteps(self.num_inference_steps)
+        #使用tpm动态调整时间步
+        t_current = torch.ones(trajectory.shape[0],device=trajectory.device) #t_0=1.0
+        #t_current = t_current*scheduler.config.num_train_timesteps
+        t_min = 0.01 #terminal
+        step = 0 
 
-
-        for t in scheduler.timesteps:
+        while(t_current > t_min).any() and step < self.max_inference_steps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
+            with torch.no_grad():
+                #获取时间步嵌入
+                time_embed = model.time_mlp(model.timestep_embedding(t_current)) #(B,256)
 
+                #获取中间特征
+                features_before,features_after = model.get_intermediate_features(
+                    sample=trajectory, 
+                    timestep=t_current, 
+                    local_cond=local_cond, 
+                    global_cond=global_cond, 
+                )
+            
+            #拼接特征
+            features = torch.cat([features_before,features_after],dim=1)
+
+            #tpm预测衰减率
+            r_n,(alpha,beta)=tpm(features,time_embed)
+
+            #更新时间步
+            t_next=r_n*t_current
+            t_next=torch.clamp(t_next,min=t_min,max=1.0)
+
+            #使用ddim计算前一步
             model_output = model(sample=trajectory,
-                                timestep=t, 
-                                local_cond=local_cond, global_cond=global_cond)
+                                timestep=t_current, 
+                                local_cond=local_cond, 
+                                global_cond=global_cond)
             
-            # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, ).prev_sample
-            
+            #自定义实现ddim
+            alpha_t=scheduler.alphas_cumprod[t_current.long()]
+            alpha_t_prev=scheduler.alphas_cumprod[t_next.long()]
+
+            trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
+            t_current=t_next
+            step+=1
                 
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]   
