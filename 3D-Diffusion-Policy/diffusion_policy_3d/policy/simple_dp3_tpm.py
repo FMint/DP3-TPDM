@@ -196,10 +196,13 @@ class SimpleDP3(BasePolicy):
 
         #使用tpm动态调整时间步
         t_current = torch.ones(trajectory.shape[0],device=trajectory.device) #t_0=1.0
-        #t_current = t_current*scheduler.config.num_train_timesteps
-        t_min = 0.01 #terminal
-        step = 0 
+        t_current = t_current*scheduler.config.num_train_timesteps-1
 
+        t_min = 0.01 #terminal
+        t_min = torch.tensor(t_min,dtype=torch.float32,device=t_current.device)
+        t_min = t_min.unsqueeze(0)
+
+        step = 0 
         while(t_current > t_min).any() and step < self.max_inference_steps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -224,15 +227,20 @@ class SimpleDP3(BasePolicy):
 
             #更新时间步
             t_next=r_n*t_current
-            t_next=torch.clamp(t_next,min=t_min,max=1.0)
-
+            #t_next=torch.clamp(t_next,min=t_min,max=torch.tensor(1.0,device=t_next.device))
+            #print("step",step)
+            #print("t_current:",t_current)
+            #print("r_n:",r_n)
+            #print("t_next:",t_next)
+            
             #使用ddim计算前一步
             model_output = model(sample=trajectory,
                                 timestep=t_current, 
                                 local_cond=local_cond, 
                                 global_cond=global_cond)
-            
+
             #自定义实现ddim
+            scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(trajectory.device)
             alpha_t=scheduler.alphas_cumprod[t_current.long()]
             alpha_t_prev=scheduler.alphas_cumprod[t_next.long()]
 
