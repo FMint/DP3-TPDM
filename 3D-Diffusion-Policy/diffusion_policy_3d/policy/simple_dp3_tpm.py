@@ -246,6 +246,7 @@ class SimpleDP3(BasePolicy):
             scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(trajectory.device)
             alpha_t=scheduler.alphas_cumprod[t_current.long()]
             alpha_t_prev=scheduler.alphas_cumprod[t_next.long()]
+            alpha_t_prev=alpha_t_prev.view(-1,1,1)
 
             trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
             t_current=t_next
@@ -631,6 +632,7 @@ class SimpleDP3(BasePolicy):
                         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(trajectory.device)
                         alpha_t=self.noise_scheduler.alphas_cumprod[t_current.long()]
                         alpha_t_prev=self.noise_scheduler.alphas_cumprod[t_next.long()]
+                        alpha_t_prev=alpha_t_prev.view(-1,1,1)
 
                         trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
                         
