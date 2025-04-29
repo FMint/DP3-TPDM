@@ -104,6 +104,9 @@ class TrainDP3Workspace:
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
+        ##dataset convert to list,prepare for tpm
+        #dataset_list = [dataset[i] for i in range(len(dataset))]
+
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
@@ -332,6 +335,25 @@ class TrainDP3Workspace:
             self.global_step += 1
             self.epoch += 1
             del step_log
+
+        ##training tpm after having trained main model
+        # 主模型训练完成后，训练 TPM 模块
+        print("Training main model completed. Starting TPM training...")
+        self.model.train_tpm_with_ppo(
+            #dataset=dataset_list,
+            dataset=train_dataloader,
+            num_epochs=cfg.training.tpm_num_epoch if hasattr(cfg.training,'tpm_num_epochs') else 200,
+            batch_size=cfg.training.tpm_batch_size if hasattr(cfg.training,'tpm_batch_size') else 256,
+            learning_rate=cfg.training.tpm_learning_rate if hasattr(cfg.training,'tpm_learning_rate') else 1.0e-5,
+            gamma=cfg.training.tpm_gamma if hasattr(cfg.training,'tpm_gamma') else 0.99,
+            clip_eps=cfg.training.tpm_clip_eps if hasattr(cfg.training,'tpm_clip_eps') else 0.2,
+            value_loss_coef=cfg.training.tpm_value_los_coef if hasattr(cfg.training,'tpm_value_los_coef') else 0.5,
+            entropy_coef=cfg.training.tpm_entropy_coef if hasattr(cfg.training,'tpm_entropy_coef') else 0.01,
+        )
+        print("TPM training completed.")
+
+        ##保存tpm训练后的检查点
+        self.save_checkpoint(tag='after_tpm')
 
     def eval(self):
         # load the latest checkpoint

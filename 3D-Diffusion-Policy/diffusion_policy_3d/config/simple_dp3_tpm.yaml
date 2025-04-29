@@ -117,6 +117,14 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  ##parameters ralated to tpm training
+  train_num_epochs: 200
+  tpm_batch_size: 256
+  tpm_learning_rate: 1.0e-5
+  tpm_gamma: 0.99
+  tpm_clip_eps: 0.2
+  tpm_value_los_coef: 0.5
+  tpm_entropy_coef: 0.01
 
 logging:
   group: ${exp_name}
