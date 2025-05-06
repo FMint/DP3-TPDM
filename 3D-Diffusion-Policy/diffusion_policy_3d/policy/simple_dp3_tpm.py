@@ -22,6 +22,7 @@ from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
 from torch.distributions.beta import Beta
 import torch.optim as optim
 from torch.distributions import Normal
+from torch.utils.data import DataLoader
 
 class TimePredictionModele(nn.Module):
     def __init__(self,
@@ -556,7 +557,7 @@ class SimpleDP3(BasePolicy):
                     if not self.use_pc_color:
                         nobs['point_cloud'] = nobs['point_cloud'][...,:3]
 
-                    print(nactions.shape)
+                    print("nactions",nactions.shape)
                     batch_size = nactions.shape[0]
                     horizon = nactions.shape[1]
 
@@ -607,7 +608,9 @@ class SimpleDP3(BasePolicy):
                         log_prob=beta_dist.log_prob(r_n).sum()
 
                         ##状态=特征+时间嵌入
-                        state=torch.cat([features,time_embed.unsqueeze(-1)],dim=1)
+                        #print("features",features.shape) #(B,1280,4)
+                        #print("time_embed",time_embed.shape) #(B,128)
+                        state=torch.cat([features,time_embed.unsqueeze(-1).expand(-1,-1,features.shape[-1])],dim=1)
 
                         ##价值估计
                         with torch.no_grad():
@@ -658,7 +661,6 @@ class SimpleDP3(BasePolicy):
                     if not self.use_pc_color:
                         nobs['point_cloud'] = nobs['point_cloud'][...,:3]
 
-                    print(nactions.shape)
                     batch_size = nactions.shape[0]
                     horizon = nactions.shape[1]
 
@@ -752,7 +754,7 @@ class SimpleDP3(BasePolicy):
             returns =[]
             advantages = []
             G=0
-            for r,d in zip(reversed(reward),reversed(done)):
+            for r,d in zip(reversed(rewards),reversed(dones)):
                 if d:
                     G=0
                 G=r+gamma*G
