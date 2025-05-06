@@ -539,17 +539,18 @@ class SimpleDP3(BasePolicy):
 
         #ppo训练循环
         for epoch in range(num_epochs):
-            #收集轨迹
-            states=[]
-            actions=[]
-            log_probs=[]
-            rewards=[]
-            values=[]
-            dones=[]
-
             if isinstance(dataset,DataLoader):
                 #使用dataloader迭代
                 for batch in dataset:
+                    #收集轨迹
+                    #每个批次重新初始化列表
+                    states=[]
+                    actions=[]
+                    log_probs=[]
+                    rewards=[]
+                    values=[]
+                    dones=[]
+
                     batch = dict_apply(batch,lambda x: x.to(self.device,non_blocking=True))
                     nobs = self.normalizer.normalize(batch['obs']) #归一化观测
                     nactions = self.normalizer['action'].normalize(batch['action']) #归一化真实动作
@@ -597,7 +598,6 @@ class SimpleDP3(BasePolicy):
                                 local_cond=local_cond, 
                                 global_cond=global_cond, 
                             )
-                        
                         features = torch.cat([features_before,features_after],dim=1)
 
                         #tpm预测r_n
@@ -700,7 +700,6 @@ class SimpleDP3(BasePolicy):
                                 local_cond=local_cond, 
                                 global_cond=global_cond, 
                             )
-                        
                         features = torch.cat([features_before,features_after],dim=1)
 
                         #tpm预测r_n
@@ -761,10 +760,16 @@ class SimpleDP3(BasePolicy):
                 returns.insert(0,G)
 
             returns=torch.tensor(returns,device=self.device)
-            values=torch.cat(values).squeeze()
+            values=torch.cat(values).squeeze()  #(num_steps*batch_size)
+
+            returns=returns.unsqueeze(1).expand(-1,batch_size).reshape(-1)
+            #print("returns shape",returns.shape) #79 #9 #36
+            #print("values shape",values.shape) #8996 #36 
+            
+            advantages=returns-values            
 
             ##标准化优势
-            advantages=(returns-advantages.mean()) / (advantages.std()+1e-8)
+            advantages=(advantages-advantages.mean()) / (advantages.std()+1e-8)
 
             ##ppo更新
             states=torch.stack(states)
