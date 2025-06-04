@@ -42,7 +42,7 @@ class TimePredictionModele(nn.Module):
 
     def forward(self,features,time_embed):
         #features:(B,1280,T),time_embed:(B,128)
-        print("features shape 3:",features.shape)  #[10,4,1280,4] #torch.Size([9, 0, 1408, 4])
+        print("features shape 3:",features.shape)  #[1280,1280,4]
         x=F.relu(self.conv1(features)) #(B,512,T)
         #融入时间步嵌入
         time_scale = self.time_step(time_embed).unsqueeze(-1) #(B,512,1)
@@ -630,7 +630,7 @@ class SimpleDP3(BasePolicy):
 
                         ##计算动作的对数概率
                         beta_dist=Beta(alpha,beta)
-                        log_prob=beta_dist.log_prob(r_n).sum()
+                        log_prob=beta_dist.log_prob(r_n).sum() #1
 
                         ##状态=特征+时间嵌入
                         state=torch.cat([features,time_embed.unsqueeze(-1).expand(-1,-1,features.shape[-1])],dim=1)
@@ -643,7 +643,7 @@ class SimpleDP3(BasePolicy):
                         ##存储
                         states.append(state) #[step,B,1408,4]
                         actions.append(r_n) #[step,B]
-                        log_probs.append(log_prob)
+                        log_probs.append(log_prob) #[step]
                         values.append(value) #B,B,B
                         
                         #更新时间步
@@ -687,9 +687,10 @@ class SimpleDP3(BasePolicy):
                         dones.append(torch.ones_like(dones[0],dtype=torch.bool))
                     
                     #添加到全局列表 extend-dim不变
-                    all_states.extend(states)
+                    states=torch.stack(states) #[10, B, 1408, 4]
+                    all_states.append(states)
                     all_actions.extend(actions)
-                    all_log_probs.extend(log_probs)
+                    all_log_probs.extend(log_probs) #80 list
                     all_rewards.extend(rewards) #[80,B]
                     # print("values[0] shape:",len(values[0]))  #128,128,128...4
                     # print("values shape:",len(values)) #10
@@ -827,44 +828,49 @@ class SimpleDP3(BasePolicy):
             ##标准化优势
             advantages=(advantages-advantages.mean()) / (advantages.std()+1e-8)
 
-            ##ppo更新
-            states=torch.stack(states) #[step,B,1408,4]
-            print("states shape",states.shape)
-            all_states=torch.cat(all_states)
-            print("all_states shape:", all_states.shape)
-            actions=torch.stack(actions)
-            print("actions shape",actions.shape)
-            all_actions=torch.cat(all_actions)
-            print("all_actions shape:", all_actions.shape)
-            old_log_probs=torch.stack(log_probs) #10
 
-            for _ in range(10): #ppo更新多次
-                ##重新计算策略和价值
-                features=all_states[:,:-128,:] #去掉time_embed部分 [4,1280,4]->[9000,1280,4]
-                time_embed=all_states[:,-128:,:] #time_embed部分 time_embed:(B,128)
-                time_embed=time_embed.squeeze(-1)
-                r_n,(alpha,beta)=self.tpm(features,time_embed)
-                beta_dist=Beta(alpha,beta)
-                new_log_probs=beta_dist.log_prob(r_n).sum()
+            #=========数据收集完毕，进入策略和价值网络优化更新===========#
+            for _ in range(10):
+                for batch_idx in range(len(batch_sizes)):
+                    batch_size=batch_sizes[batch_idx]
 
-                value_pred=critic(features).squeeze()
+                    start_idx=batch_idx*max_steps
+                    end_idx=(batch_idx+1)*max_steps
 
-                ##计算ppo损失
-                ratio = torch.exp(new_log_probs-old_log_probs)
-                surr1=ratio*advantages
-                surr2=torch.clamp(ratio,1-clip_eps,1+clip_eps)*advantages
-                policy_loss=-torch.min(surr1,surr2).mean()
+                    batch_states=all_states[batch_idx] #10*[128, 1408, 4]->8*[10, 128, 1408, 4]
+                    batch_actions=all_actions[start_idx:end_idx]
+                    batch_log_probs=all_log_probs[start_idx:end_idx] #10
+                    batch_advantages=advantages[start_idx*batch_size:end_idx*batch_size].view(max_steps,batch_size) #[10,128]
+                    batch_returns=all_returns[start_idx*batch_size:end_idx*batch_size].view(max_steps,batch_size) #[10,128]
 
-                value_loss=F.mse_loss(value_pred,returns)
+                    features=batch_states[:,:,:-128,:]
+                    time_embed=batch_states[:,:,-128:,0].squeeze(-1)
+                    features=rearrange(features,'s b c t -> (s b) c t')
+                    time_embed=rearrange(time_embed,'s b c -> (s b) c')
 
-                entropy=beta_dist.entropy().mean()
-                loss=policy_loss + value_loss_coef*value_loss - entropy_coef*entropy
+                    r_n,(alpha,beta)=self.tpm(features,time_embed)
+                    beta_dist=Beta(alpha,beta)
+                    new_log_probs=beta_dist.log_prob(r_n).view(max_steps,batch_size) #[10,128]
 
-                ##更新参数
-                optimizer.zero_grad()
-                critic_optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                critic_optimizer.step()
+                    value_pred=critic(features).view(max_steps,batch_size)
+
+                    batch_log_probs=torch.stack(batch_log_probs) #[10]
+                    batch_log_probs=batch_log_probs.unsqueeze(-1).expand(-1,batch_size) #[10,128]
+
+                    ##计算ppo损失
+                    ratio=torch.exp(new_log_probs-batch_log_probs)
+                    surr1=ratio*batch_advantages
+                    surr2=torch.clamp(ratio,1-clip_eps,1+clip_eps)*batch_advantages
+                    policy_loss=-torch.min(surr1,surr2).mean()
+                    value_loss=F.mse_loss(value_pred,batch_returns)
+                    entropy=beta_dist.entropy().mean()
+                    loss=policy_loss+value_loss_coef*value_loss-entropy_coef*entropy
+
+                    ##更新参数
+                    optimizer.zero_grad()
+                    critic_optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    critic_optimizer.step()
 
             print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
