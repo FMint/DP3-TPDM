@@ -580,7 +580,6 @@ class SimpleDP3(BasePolicy):
                     if not self.use_pc_color:
                         nobs['point_cloud'] = nobs['point_cloud'][...,:3]
 
-                    print("nactions",nactions.shape)
                     batch_size = nactions.shape[0]
                     horizon = nactions.shape[1]
                     batch_sizes.append(batch_size)
@@ -623,18 +622,16 @@ class SimpleDP3(BasePolicy):
                                 global_cond=global_cond, 
                             )
                         features = torch.cat([features_before,features_after],dim=1) #(B,1280,4)
-                        # print("features shape 2:",features.shape)
 
                         #tpm预测r_n
                         r_n,(alpha,beta)=self.tpm(features,time_embed)
 
                         ##计算动作的对数概率
                         beta_dist=Beta(alpha,beta)
-                        log_prob=beta_dist.log_prob(r_n).sum() #1
+                        log_prob=beta_dist.log_prob(r_n).sum().detach() #1
 
                         ##状态=特征+时间嵌入
                         state=torch.cat([features,time_embed.unsqueeze(-1).expand(-1,-1,features.shape[-1])],dim=1)
-                        # print("state shape:",state.shape) #[B,1408,4]
 
                         ##价值估计
                         with torch.no_grad():
@@ -692,14 +689,9 @@ class SimpleDP3(BasePolicy):
                     all_actions.extend(actions)
                     all_log_probs.extend(log_probs) #80 list
                     all_rewards.extend(rewards) #[80,B]
-                    # print("values[0] shape:",len(values[0]))  #128,128,128...4
-                    # print("values shape:",len(values)) #10
                     all_values.extend(values)
-                    # print("all_values shape:",len(all_values)) #60,70,80
                     all_dones.extend(dones)
 
-                    print("rewards:",torch.stack(rewards).shape) #[10,B]
-                    print("values:",torch.stack(values).shape) #[10,B,1]
 
             else:
                 print("dataloader method change...")
@@ -823,14 +815,13 @@ class SimpleDP3(BasePolicy):
             all_returns=torch.tensor(all_returns,device=self.device).reshape(-1) #[9000]
             all_values=torch.cat(all_values).squeeze() #[9000]
             advantages=all_returns-all_values #[9000]
-            print("advantages",advantages.shape)
             
             ##标准化优势
             advantages=(advantages-advantages.mean()) / (advantages.std()+1e-8)
 
 
             #=========数据收集完毕，进入策略和价值网络优化更新===========#
-            for _ in range(10):
+            for _ in range(5):
                 for batch_idx in range(len(batch_sizes)):
                     batch_size=batch_sizes[batch_idx]
 
