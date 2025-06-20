@@ -124,9 +124,8 @@ class MetaworldRunner(BaseRunner):
         if len(videos.shape) == 5:
             videos = videos[:, 0]  # select first frame
         
-        if save_video:
-            videos_wandb = wandb.Video(videos, fps=self.fps, format="mp4")
-            log_data[f'sim_video_eval'] = videos_wandb
+        videos_wandb = wandb.Video(videos, fps=self.fps, format="mp4")
+        log_data[f'sim_video_eval'] = videos_wandb
 
         _ = env.reset()
         videos = None
