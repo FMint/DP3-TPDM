@@ -607,8 +607,15 @@ class SimpleDP3(BasePolicy):
                     #去噪过程   #====be similar to conditional_sample===#
                     trajectory = torch.randn_like(cond_data)
                     t_current = torch.ones((batch_size,),device=self.device)
-                    t_min = 0.01
+                    t_min = torch.full_like(t_current,0.1)
                     step=0
+
+                    #pre-batch mertics
+                    batch_r_n=[]
+                    batch_t_current=[]
+                    batch_alpha=[]
+                    batch_beta=[]
+                    batch_rewards=[]
 
                     while(t_current > t_min).any() and step < self.max_inference_steps:
                         trajectory[cond_mask] = cond_data[cond_mask]
@@ -628,7 +635,7 @@ class SimpleDP3(BasePolicy):
 
                         ##计算动作的对数概率
                         beta_dist=Beta(alpha,beta)
-                        log_prob=beta_dist.log_prob(r_n).sum().detach() #1
+                        log_prob=beta_dist.log_prob(r_n).detach() #B
 
                         ##状态=特征+时间嵌入
                         state=torch.cat([features,time_embed.unsqueeze(-1).expand(-1,-1,features.shape[-1])],dim=1)
@@ -640,11 +647,15 @@ class SimpleDP3(BasePolicy):
                         ##存储
                         states.append(state) #[step,B,1408,4]
                         actions.append(r_n) #[step,B]
-                        log_probs.append(log_prob) #[step]
+                        log_probs.append(log_prob) #[step，B]
                         values.append(value) #B,B,B
                         
                         #更新时间步
                         t_next=r_n*t_current
+                        if t_current[0]==1:
+                            t_current=t_next
+                            t_next=r_n*t_current
+                        # print("t_current:",t_current[0])
                         
                         #使用ddim计算前一步
                         model_output = self.model(sample=trajectory,
@@ -654,8 +665,8 @@ class SimpleDP3(BasePolicy):
 
                         #自定义实现ddim
                         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(trajectory.device)
-                        alpha_t=self.noise_scheduler.alphas_cumprod[t_current.long()]
-                        alpha_t_prev=self.noise_scheduler.alphas_cumprod[t_next.long()]
+                        alpha_t=self.noise_scheduler.alphas_cumprod[torch.floor(100*t_current).long()]
+                        alpha_t_prev=self.noise_scheduler.alphas_cumprod[torch.floor(100*t_next).long()]
                         alpha_t_prev=alpha_t_prev.view(-1,1,1)
 
                         trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output #[B,T,D]
@@ -678,7 +689,7 @@ class SimpleDP3(BasePolicy):
                     while len(states) < self.max_inference_steps:
                         states.append(torch.zeros_like(states[0]))
                         actions.append(torch.zeros_like(actions[0]))
-                        log_probs.append(torch.tensor(0.0,device=self.device))
+                        log_probs.append(torch.zeros_like(log_probs[0]))
                         values.append(torch.zeros_like(values[0]))
                         rewards.append(torch.zeros_like(rewards[0]))  #[step,B]
                         dones.append(torch.ones_like(dones[0],dtype=torch.bool))
@@ -687,7 +698,7 @@ class SimpleDP3(BasePolicy):
                     states=torch.stack(states) #[10, B, 1408, 4]
                     all_states.append(states)
                     all_actions.extend(actions)
-                    all_log_probs.extend(log_probs) #80 list
+                    all_log_probs.extend(log_probs) #[80,B]
                     all_rewards.extend(rewards) #[80,B]
                     all_values.extend(values)
                     all_dones.extend(dones)
@@ -819,6 +830,7 @@ class SimpleDP3(BasePolicy):
             ##标准化优势
             advantages=(advantages-advantages.mean()) / (advantages.std()+1e-8)
 
+            all_log_probs=torch.stack(all_log_probs,dim=0)
 
             #=========数据收集完毕，进入策略和价值网络优化更新===========#
             for _ in range(5):
@@ -830,7 +842,7 @@ class SimpleDP3(BasePolicy):
 
                     batch_states=all_states[batch_idx] #10*[128, 1408, 4]->8*[10, 128, 1408, 4]
                     batch_actions=all_actions[start_idx:end_idx]
-                    batch_log_probs=all_log_probs[start_idx:end_idx] #10
+                    batch_log_probs=all_log_probs[start_idx:end_idx] #[10,B]
                     batch_advantages=advantages[start_idx*batch_size:end_idx*batch_size].view(max_steps,batch_size) #[10,128]
                     batch_returns=all_returns[start_idx*batch_size:end_idx*batch_size].view(max_steps,batch_size) #[10,128]
 
@@ -845,8 +857,8 @@ class SimpleDP3(BasePolicy):
 
                     value_pred=critic(features).view(max_steps,batch_size)
 
-                    batch_log_probs=torch.stack(batch_log_probs) #[10]
-                    batch_log_probs=batch_log_probs.unsqueeze(-1).expand(-1,batch_size) #[10,128]
+                    # batch_log_probs=torch.stack(batch_log_probs) #[10]
+                    # batch_log_probs=batch_log_probs.unsqueeze(-1).expand(-1,batch_size) #[10,128]
 
                     ##计算ppo损失
                     ratio=torch.exp(new_log_probs-batch_log_probs)
@@ -865,3 +877,4 @@ class SimpleDP3(BasePolicy):
                     critic_optimizer.step()
 
             print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+            # np.save(f'tpm_metrics_epoch_{epoch+1}.npy', epoch_metrics)
