@@ -892,6 +892,13 @@ class SimpleDP3(BasePolicy):
             epoch_metrics['alpha_mean'].append(np.mean([b.mean() for b in batch_alpha if len(b) > 0]))
             epoch_metrics['beta_mean'].append(np.mean([b.mean() for b in batch_beta if len(b) > 0]))
 
+            # 计算当前epoch的平均loss
+            min_loss_threshold=1e-6
+            current_loss = np.mean(batch_losses)
+            if current_loss < min_loss_threshold:
+                logger.info(f"Early stopping: Loss {current_loss:.6f} below threshold {min_loss_threshold}")
+                break
+               
             logger.info(f"Epoch {epoch+1}/{num_epochs} Summary: "
                        f"Loss: {np.mean(batch_losses):.4f}, "
                        f"r_n Mean: {epoch_metrics['r_n_mean'][-1]:.4f}, "
