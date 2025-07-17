@@ -24,6 +24,12 @@ import torch.optim as optim
 from torch.distributions import Normal
 from torch.utils.data import DataLoader
 
+import numpy as np
+import os
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger=logging.getLogger(__name__)
+
 class TimePredictionModele(nn.Module):
     def __init__(self,
                  input_dim=1280,
@@ -180,7 +186,14 @@ class SimpleDP3(BasePolicy):
 
         print_params(self)
         
-    # ========= inference  ============
+    # ========= inference  ============#
+    def load_tpm(self, tpm_checkpoint_path):
+        """Load trained TPM weights from a checkpoint."""
+        tpm_state_dict = torch.load(tpm_checkpoint_path, map_location=self.device)
+        self.tpm.load_state_dict(tpm_state_dict)
+        self.tpm.eval()
+        logger.info(f"Loaded TPM weights from {tpm_checkpoint_path}")
+
     def conditional_sample(self, 
             condition_data, condition_mask,
             condition_data_pc=None, condition_mask_pc=None,
@@ -202,11 +215,18 @@ class SimpleDP3(BasePolicy):
         t_current = torch.ones(trajectory.shape[0],device=trajectory.device) #t_0=1.0
         t_current = t_current*scheduler.config.num_train_timesteps-1
 
-        t_min = 0.01 #terminal
-        t_min = torch.tensor(t_min,dtype=torch.float32,device=t_current.device)
+        t_min = torch.tensor(0.01,dtype=torch.float32,device=t_current.device)
         t_min = t_min.unsqueeze(0)
 
         step = 0 
+        inference_metrics = {
+            'r_n': [],
+            'step': 0,
+            't_current': [],
+            't_next': [],
+            'alpha': [],
+            'beta': [],
+        }
         while(t_current > t_min).any() and step < self.max_inference_steps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -225,12 +245,23 @@ class SimpleDP3(BasePolicy):
             
             #拼接特征
             features = torch.cat([features_before,features_after],dim=1)
+            # print("feature shape 1:",features.shape)
 
             #tpm预测衰减率
             r_n,(alpha,beta)=tpm(features,time_embed)
 
             #更新时间步
             t_next=r_n*t_current
+            #t_next=torch.clamp(t_next,min=t_min,max=torch.tensor(1.0,device=t_next.device))
+            
+            inference_metrics['r_n'].append(r_n.cpu().numpy())
+            inference_metrics['t_current'].append(t_current.cpu().numpy())
+            inference_metrics['alpha'].append(alpha.cpu().numpy())
+            inference_metrics['beta'].append(beta.cpu().numpy())
+            # print("step",step)
+            # print("t_current:",t_current)
+            # print("r_n:",r_n)
+            # print("t_next:",t_next)
 
             #使用ddim计算前一步
             model_output = model(sample=trajectory,
@@ -241,16 +272,49 @@ class SimpleDP3(BasePolicy):
 
             #自定义实现ddim
             scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(trajectory.device)
-            alpha_t=scheduler.alphas_cumprod[t_current.long()]
-            alpha_t_prev=scheduler.alphas_cumprod[t_next.long()]
-            alpha_t_prev=alpha_t_prev.view(-1,1,1)
+            #print(scheduler.alphas_cumprod)
+            alpha_t = scheduler.alphas_cumprod[t_current.long()]
+            alpha_t_prev = scheduler.alphas_cumprod[t_next.long()]
+            alpha_t_prev = alpha_t_prev.view(-1,1,1)
+            #print("alpha_t_prev: ",alpha_t_prev.shape)
+            #print("model_output: ",model_output.shape)
+            #print("r_n",r_n.shape)
 
-            trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
+            if scheduler.config.prediction_type == 'epsilon':
+                # predict noise
+                # pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+
+                x0_pred = (trajectory - torch.sqrt(1 - alpha_t_prev) * model_output) / torch.sqrt(alpha_t_prev)
+            elif scheduler.config.prediction_type == 'sample':
+                # predict sample
+                x0_pred = model_output
+
+            # Clip "predicted x_0"
+            if self.config.clip_sample:
+                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+
+            trajectory = torch.sqrt(alpha_t_prev)*x0_pred+torch.sqrt(1-alpha_t_prev)*model_output
+            #print("trajectory: ",trajectory)
             t_current=t_next
+            #print(t_current)
             step+=1
                 
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]   
+        trajectory[condition_mask] = condition_data[condition_mask]  
+        inference_metrics['step'] = step
+        inference_metrics['r_n']=np.stack(inference_metrics['r_n'])
+        inference_metrics['t_current']=np.stack(inference_metrics['t_current'])
+        # inference_metrics['t_next']= np.stack([t_current.cpu().numpy()]*inference_metrics['r_n'].shape[0])
+        inference_metrics['alpha']=np.stack(inference_metrics['alpha'])
+        inference_metrics['beta']=np.stack(inference_metrics['beta'])
+        logger.info(f"TPM inference metrics: "
+                    f"steps={step}, "
+                    f"r_n={inference_metrics['r_n']}, "
+                    f"r_n_mean={inference_metrics['r_n'].mean():.4f}, "
+                    f"r_n_std={inference_metrics['r_n'].std():.4f}, "
+                    f"alpha mean: {inference_metrics['alpha'].mean():.4f}, "
+                    f"beta mean: {inference_metrics['beta'].mean():.4f}")
 
 
         return trajectory
@@ -414,8 +478,8 @@ class SimpleDP3(BasePolicy):
         
         pred = self.model(sample=noisy_trajectory, 
                         timestep=timesteps, 
-                            local_cond=local_cond, 
-                            global_cond=global_cond)
+                        local_cond=local_cond, 
+                        global_cond=global_cond)
 
 
         pred_type = self.noise_scheduler.config.prediction_type 
@@ -502,6 +566,21 @@ class SimpleDP3(BasePolicy):
             value_loss_coef: float, 价值损失权重
             entrepy_coef: float, 熵正则化权重
         """
+        import time
+        timestep=time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        tpm_checkpoint_dir=os.path.join("checkpoints/tpm",f"tpm_{timestep}")
+        os.makedirs(tpm_checkpoint_dir, exist_ok=True)
+        epoch_metrics = {
+            'loss': [],
+            'r_n': [],
+            'r_n_mean': [],
+            'step_counts': [],
+            't_current': [],
+            'reward_mean': [],
+            'alpha_mean': [],
+            'beta_mean': [],
+        }
+
         #冻结ConditionalUnet1D和obs_encoder
         self.model.eval()
         self.obs_encoder.eval()
@@ -529,11 +608,13 @@ class SimpleDP3(BasePolicy):
         #critic_optimizer=optim.AdamW(critic.parameters(),lr=learning_rate,betas=[0.9,0.99])
 
         ##如果dataset是dataloader，直接使用；否则列表切片
-        if isinstance(dataset,DataLoader):
-            data_iter = None
-        else:
-            data_iter = iter(dataset)
+        # if isinstance(dataset,DataLoader):
+        #     data_iter = None
+        # else:
+        #     data_iter = iter(dataset)
 
+        # print(f"DataLoader batch_size: {dataset.batch_size}")
+        # print(f"Dataset length: {len(dataset)}")
 
         #ppo训练循环
         for epoch in range(num_epochs):
@@ -545,10 +626,15 @@ class SimpleDP3(BasePolicy):
             all_dones = []
             batch_sizes = []
             batch_step_counts = [] #记录实际去噪步数
+            batch_losses = []
+            batch_r_n = []
+            batch_rewards = []
+            batch_alpha = []
+            batch_beta = []
 
             if isinstance(dataset,DataLoader):
                 #使用dataloader迭代
-                for batch in dataset:
+                for batch_idx, batch in enumerate(dataset):
 
                     batch = dict_apply(batch,lambda x: x.to(self.device,non_blocking=True))
                     nobs = self.normalizer.normalize(batch['obs']) #归一化观测
@@ -596,6 +682,11 @@ class SimpleDP3(BasePolicy):
                     sample_rewards = [[] for _ in range(batch_size)] #每个样本的奖励
                     sample_dones = [[] for _ in range(batch_size)] #每个样本的终止标志
 
+                    batch_r_n_temp = []
+                    batch_alpha_temp = []
+                    batch_beta_temp = []
+                    batch_rewards_temp = []
+
                     while active_mask.any() and step < self.max_inference_steps:
                         trajectory[cond_mask] = cond_data[cond_mask]
 
@@ -631,6 +722,10 @@ class SimpleDP3(BasePolicy):
                             t_current=t_next
                             t_next=r_n*t_current
 
+                        batch_r_n_temp.append(r_n.cpu().numpy())
+                        batch_alpha_temp.append(alpha.detach().cpu().numpy())
+                        batch_beta_temp.append(beta.detach().cpu().numpy())
+
                         #按样本索引存储数据
                         for idx, active_index in enumerate(active_indices):
                             sample_states[active_index].append(state[idx].unsqueeze(0))  # [1,1408,4]
@@ -648,9 +743,18 @@ class SimpleDP3(BasePolicy):
                             alpha_t_prev=self.noise_scheduler.alphas_cumprod[torch.floor(100*t_next[idx]).long()]
                             alpha_t_prev=alpha_t_prev.view(1,1,1)
 
-                            trajectory[active_index] = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
+                            if self.noise_scheduler.config.prediction_type == 'epsilon':
+                                x0_pred = (trajectory[active_index].unsqueeze(0) - torch.sqrt(1 - alpha_t_prev) * model_output) / torch.sqrt(alpha_t_prev)
+                            else:
+                                x0_pred = model_output
 
+                            # Clip "predicted x_0"
+                            if self.noise_scheduler.config.clip_sample:
+                                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+                            trajectory[active_index] = torch.sqrt(alpha_t_prev)*x0_pred+torch.sqrt(1-alpha_t_prev)*model_output
                             reward=self.compute_tpm_reward(trajectory[active_index].unsqueeze(0),t_current[active_index].unsqueeze(0),r_n[idx].unsqueeze(0),nactions[active_index].unsqueeze(0),t_min[active_index].unsqueeze(0)) #[B]
+                            batch_rewards_temp.append(reward.cpu().numpy().item())
                             sample_rewards[active_index].append(reward.unsqueeze(0))  # [B]
                             done=(t_current[active_index]<t_min[active_index]) | (step>=self.max_inference_steps-1) #[B]
                             sample_dones[active_index].append(done.unsqueeze(0))  # [B]
@@ -663,7 +767,21 @@ class SimpleDP3(BasePolicy):
                     
                     #记录该batch步数step
                     batch_step_counts.append(step_counts.tolist())  #step_counts[128]
-                    print("batch_step_counts",batch_step_counts)
+                    # print("batch_step_counts",batch_step_counts)
+                    batch_r_n.append(np.concatenate(batch_r_n_temp) if batch_r_n_temp else np.array([]))
+                    batch_alpha.append(np.concatenate(batch_alpha_temp) if batch_alpha_temp else np.array([]))
+                    batch_beta.append(np.concatenate(batch_beta_temp) if batch_beta_temp else np.array([]))
+                    batch_rewards.append(np.array(batch_rewards_temp) if batch_rewards_temp else np.array([]))
+
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: "
+                            f"Step Counts Mean: {np.mean(step_counts.cpu().numpy()):.2f}, "
+                            # f"Step Counts Std: {np.std(step_counts.cpu().numpy()):.2f}, "
+                            f"r_n Mean: {np.mean(batch_r_n[-1]):.4f}, "
+                            # f"r_n Std: {np.std(batch_r_n[-1]):.4f}, "
+                            f"Reward Mean: {np.mean(batch_rewards[-1]):.4f}, "
+                            f"Alpha Mean: {alpha.mean().item():.4f}, "
+                            f"Beta Mean: {beta.mean().item():.4f}"
+                            )
 
                     #将每个样本的轨迹拼接成tensor
                     for i in range(batch_size): #[128]
@@ -675,12 +793,18 @@ class SimpleDP3(BasePolicy):
                         sample_dones[i] = torch.cat(sample_dones[i], dim=0) if sample_dones[i] else torch.zeros((0,), device=self.device) #[k]
 
                     #存储到all_states
-                    all_states.append(sample_states if sample_states[0].numel() else torch.zeros((0, 1408, 4), device=self.device)) #batch*[128]
-                    all_actions.append(sample_actions if sample_actions[0].numel() else torch.zeros((batch_size, 0), device=self.device))
-                    all_log_probs.append(sample_log_probs if sample_log_probs[0].numel() else torch.zeros((batch_size, 0), device=self.device))
-                    all_values.append(sample_values if sample_values[0].numel() else torch.zeros((batch_size, 0, 1), device=self.device))
-                    all_rewards.append(sample_rewards if sample_rewards[0].numel() else torch.zeros((batch_size, 0), device=self.device))
-                    all_dones.append(sample_dones if sample_dones[0].numel() else torch.zeros((batch_size, 0), dtype=torch.bool, device=self.device))
+                    all_states.append(sample_states)
+                    all_actions.append(sample_actions)
+                    all_log_probs.append(sample_log_probs)
+                    all_values.append(sample_values)
+                    all_rewards.append(sample_rewards)
+                    all_dones.append(sample_dones)
+                    # all_states.append(sample_states if sample_states[0].numel() else torch.zeros((0, 1408, 4), device=self.device)) #batch*[128]
+                    # all_actions.append(sample_actions if sample_actions[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_log_probs.append(sample_log_probs if sample_log_probs[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_values.append(sample_values if sample_values[0].numel() else torch.zeros((batch_size, 0, 1), device=self.device))
+                    # all_rewards.append(sample_rewards if sample_rewards[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_dones.append(sample_dones if sample_dones[0].numel() else torch.zeros((batch_size, 0), dtype=torch.bool, device=self.device))
 
             else:
                 print("dataloader method change...")
@@ -691,6 +815,8 @@ class SimpleDP3(BasePolicy):
                     batch_size=batch_sizes[batch_idx]
                     batch_step=batch_step_counts[batch_idx]
 
+                    # start_idx=batch_idx*max_steps
+                    # end_idx=(batch_idx+1)*max_steps
 
                     batch_states=all_states[batch_idx] #128*[step, 1408, 4]
                     batch_actions=all_actions[batch_idx]
@@ -699,8 +825,13 @@ class SimpleDP3(BasePolicy):
                     batch_rewards=all_rewards[batch_idx] #128*[k,1]
                     batch_dones=all_dones[batch_idx] #128*[k]
 
+                    # batch_returns=[]
+                    # batch_advantages=[]
+
                     for i in range(batch_size):
                         step_count=batch_step[i]
+                        if step_count == 0:
+                            continue
                         values_i=batch_values[i][:step_count]
                         state_i=batch_states[i][:step_count]
                         log_probs_i=batch_log_probs[i][:step_count]
@@ -747,5 +878,37 @@ class SimpleDP3(BasePolicy):
                         optimizer.step()
                         critic_optimizer.step()
 
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+                        batch_losses.append(loss.item())
+                        
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: "
+                                f"PPO Loss: {np.mean(batch_losses):.4f}")
+            # print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+        
+            epoch_metrics['loss'].append(np.mean(batch_losses))
+            epoch_metrics['r_n_mean'].append(np.mean([b.mean() for b in batch_r_n if len(b) > 0]))
+            # epoch_metrics['r_n_std'].append(np.mean([b.std() for b in batch_r_n if len(b) > 0]))
+            # epoch_metrics['reward_mean'].append(np.mean([b.mean() for b in batch_rewards if len(b) > 0]))
+            epoch_metrics['step_counts'].append(np.mean(batch_step_counts))
+            epoch_metrics['alpha_mean'].append(np.mean([b.mean() for b in batch_alpha if len(b) > 0]))
+            epoch_metrics['beta_mean'].append(np.mean([b.mean() for b in batch_beta if len(b) > 0]))
+
+            logger.info(f"Epoch {epoch+1}/{num_epochs} Summary: "
+                       f"Loss: {np.mean(batch_losses):.4f}, "
+                       f"r_n Mean: {epoch_metrics['r_n_mean'][-1]:.4f}, "
+                       f"Step Counts Mean: {np.mean(batch_step_counts):.2f}, "
+                    #    f"r_n Std: {epoch_metrics['r_n_std'][-1]:.4f}, "
+                    #    f"Reward Mean: {epoch_metrics['reward_mean'][-1]:.4f}, "
+                       f"Alpha Mean: {epoch_metrics['alpha_mean'][-1]:.4f}, "
+                       f"Beta Mean: {epoch_metrics['beta_mean'][-1]:.4f}")
+
+            
+            if (epoch + 1) % 5 == 0:
+                #保存模型
+                # tpm_checkpoint_path = f"checkpoints/tpm/tpm_epoch_{epoch+1}.pt"
+                tpm_checkpoint_path = os.path.join(tpm_checkpoint_dir, f"tpm_epoch_{epoch+1}.pt")
+                torch.save(self.tpm.state_dict(), tpm_checkpoint_path)
+                logger.info(f"Saved TPM checkpoint to {tpm_checkpoint_path}")
             # np.save(f'tpm_metrics_epoch_{epoch+1}.npy', epoch_metrics)
+
+        logger.info("TPM training completed.")
+        return epoch_metrics
