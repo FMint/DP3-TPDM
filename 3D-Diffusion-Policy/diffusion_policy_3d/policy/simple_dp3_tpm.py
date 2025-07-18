@@ -421,7 +421,6 @@ class SimpleDP3(BasePolicy):
         cond_data = trajectory
         
        
-        
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
@@ -898,7 +897,7 @@ class SimpleDP3(BasePolicy):
             if current_loss < min_loss_threshold:
                 logger.info(f"Early stopping: Loss {current_loss:.6f} below threshold {min_loss_threshold}")
                 break
-               
+
             logger.info(f"Epoch {epoch+1}/{num_epochs} Summary: "
                        f"Loss: {np.mean(batch_losses):.4f}, "
                        f"r_n Mean: {epoch_metrics['r_n_mean'][-1]:.4f}, "
@@ -916,6 +915,19 @@ class SimpleDP3(BasePolicy):
                 torch.save(self.tpm.state_dict(), tpm_checkpoint_path)
                 logger.info(f"Saved TPM checkpoint to {tpm_checkpoint_path}")
             # np.save(f'tpm_metrics_epoch_{epoch+1}.npy', epoch_metrics)
+
+                complete_model_path = os.path.join(tpm_checkpoint_dir, f"complete_epoch_{epoch+1}.pt")
+                complete_state = {
+                    'model': self.model.state_dict(),
+                    'tpm': self.tpm.state_dict(),
+                    # 'optimizer': optimizer.state_dict(),
+                    # 'critic_optimizer': critic_optimizer.state_dict(),
+                    'epoch': epoch + 1,
+                    # 'batch_idx': batch_idx + 1,
+                    'epoch_metrics': epoch_metrics
+                }
+                torch.save(complete_state, complete_model_path)
+                logger.info(f"Saved complete model checkpoint to {complete_model_path}")
 
         logger.info("TPM training completed.")
         return epoch_metrics
