@@ -118,7 +118,7 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
   ##parameters ralated to tpm training
-  train_num_epochs: 200
+  tpm_num_epoch: 200
   tpm_batch_size: 256
   tpm_learning_rate: 1.0e-5
   tpm_gamma: 0.99

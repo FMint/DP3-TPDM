@@ -22,11 +22,18 @@ from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
 from torch.distributions.beta import Beta
 import torch.optim as optim
 from torch.distributions import Normal
+from torch.utils.data import DataLoader
+
+import numpy as np
+import os
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger=logging.getLogger(__name__)
 
 class TimePredictionModele(nn.Module):
     def __init__(self,
                  input_dim=1280,
-                 time_embed_dim=256,
+                 time_embed_dim=128,
                  hidden_dim=512,
                  output_dim=2):
         super().__init__()
@@ -40,7 +47,8 @@ class TimePredictionModele(nn.Module):
         self.fc = nn.Linear(hidden_dim//2,output_dim)
 
     def forward(self,features,time_embed):
-        #features:(B,1280,T),time_embed:(B,256)
+        #features:(step,1280,T),time_embed:(step,128)
+        # print("features shape 3:",features.shape)  #[1280,1280,4]
         x=F.relu(self.conv1(features)) #(B,512,T)
         #融入时间步嵌入
         time_scale = self.time_step(time_embed).unsqueeze(-1) #(B,512,1)
@@ -178,7 +186,14 @@ class SimpleDP3(BasePolicy):
 
         print_params(self)
         
-    # ========= inference  ============
+    # ========= inference  ============#
+    def load_tpm(self, tpm_checkpoint_path):
+        """Load trained TPM weights from a checkpoint."""
+        tpm_state_dict = torch.load(tpm_checkpoint_path, map_location=self.device)
+        self.tpm.load_state_dict(tpm_state_dict)
+        self.tpm.eval()
+        logger.info(f"Loaded TPM weights from {tpm_checkpoint_path}")
+
     def conditional_sample(self, 
             condition_data, condition_mask,
             condition_data_pc=None, condition_mask_pc=None,
@@ -200,18 +215,25 @@ class SimpleDP3(BasePolicy):
         t_current = torch.ones(trajectory.shape[0],device=trajectory.device) #t_0=1.0
         t_current = t_current*scheduler.config.num_train_timesteps-1
 
-        t_min = 0.01 #terminal
-        t_min = torch.tensor(t_min,dtype=torch.float32,device=t_current.device)
+        t_min = torch.tensor(0.01,dtype=torch.float32,device=t_current.device)
         t_min = t_min.unsqueeze(0)
 
         step = 0 
+        inference_metrics = {
+            'r_n': [],
+            'step': 0,
+            't_current': [],
+            't_next': [],
+            'alpha': [],
+            'beta': [],
+        }
         while(t_current > t_min).any() and step < self.max_inference_steps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
             with torch.no_grad():
                 #获取时间步嵌入
-                time_embed = model.time_mlp(model.timestep_embedding(t_current)) #(B,256)
+                time_embed = model.time_mlp(model.timestep_embedding(t_current)) #(B,128)
 
                 #获取中间特征
                 features_before,features_after = model.get_intermediate_features(
@@ -223,6 +245,7 @@ class SimpleDP3(BasePolicy):
             
             #拼接特征
             features = torch.cat([features_before,features_after],dim=1)
+            # print("feature shape 1:",features.shape)
 
             #tpm预测衰减率
             r_n,(alpha,beta)=tpm(features,time_embed)
@@ -231,6 +254,10 @@ class SimpleDP3(BasePolicy):
             t_next=r_n*t_current
             #t_next=torch.clamp(t_next,min=t_min,max=torch.tensor(1.0,device=t_next.device))
             
+            inference_metrics['r_n'].append(r_n.cpu().numpy())
+            inference_metrics['t_current'].append(t_current.cpu().numpy())
+            inference_metrics['alpha'].append(alpha.cpu().numpy())
+            inference_metrics['beta'].append(beta.cpu().numpy())
             # print("step",step)
             # print("t_current:",t_current)
             # print("r_n:",r_n)
@@ -241,18 +268,53 @@ class SimpleDP3(BasePolicy):
                                 timestep=t_current, 
                                 local_cond=local_cond, 
                                 global_cond=global_cond)
+            #print(model_output)
 
             #自定义实现ddim
             scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(trajectory.device)
-            alpha_t=scheduler.alphas_cumprod[t_current.long()]
-            alpha_t_prev=scheduler.alphas_cumprod[t_next.long()]
+            #print(scheduler.alphas_cumprod)
+            alpha_t = scheduler.alphas_cumprod[t_current.long()]
+            alpha_t_prev = scheduler.alphas_cumprod[t_next.long()]
+            alpha_t_prev = alpha_t_prev.view(-1,1,1)
+            #print("alpha_t_prev: ",alpha_t_prev.shape)
+            #print("model_output: ",model_output.shape)
+            #print("r_n",r_n.shape)
 
-            trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
+            if scheduler.config.prediction_type == 'epsilon':
+                # predict noise
+                # pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+
+                x0_pred = (trajectory - torch.sqrt(1 - alpha_t_prev) * model_output) / torch.sqrt(alpha_t_prev)
+            elif scheduler.config.prediction_type == 'sample':
+                # predict sample
+                x0_pred = model_output
+
+            # Clip "predicted x_0"
+            if self.config.clip_sample:
+                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+
+            trajectory = torch.sqrt(alpha_t_prev)*x0_pred+torch.sqrt(1-alpha_t_prev)*model_output
+            #print("trajectory: ",trajectory)
             t_current=t_next
+            #print(t_current)
             step+=1
                 
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]   
+        trajectory[condition_mask] = condition_data[condition_mask]  
+        inference_metrics['step'] = step
+        inference_metrics['r_n']=np.stack(inference_metrics['r_n'])
+        inference_metrics['t_current']=np.stack(inference_metrics['t_current'])
+        # inference_metrics['t_next']= np.stack([t_current.cpu().numpy()]*inference_metrics['r_n'].shape[0])
+        inference_metrics['alpha']=np.stack(inference_metrics['alpha'])
+        inference_metrics['beta']=np.stack(inference_metrics['beta'])
+        logger.info(f"TPM inference metrics: "
+                    f"steps={step}, "
+                    f"r_n={inference_metrics['r_n']}, "
+                    f"r_n_mean={inference_metrics['r_n'].mean():.4f}, "
+                    f"r_n_std={inference_metrics['r_n'].std():.4f}, "
+                    f"alpha mean: {inference_metrics['alpha'].mean():.4f}, "
+                    f"beta mean: {inference_metrics['beta'].mean():.4f}")
 
 
         return trajectory
@@ -359,7 +421,6 @@ class SimpleDP3(BasePolicy):
         cond_data = trajectory
         
        
-        
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
@@ -416,8 +477,8 @@ class SimpleDP3(BasePolicy):
         
         pred = self.model(sample=noisy_trajectory, 
                         timestep=timesteps, 
-                            local_cond=local_cond, 
-                            global_cond=global_cond)
+                        local_cond=local_cond, 
+                        global_cond=global_cond)
 
 
         pred_type = self.noise_scheduler.config.prediction_type 
@@ -466,17 +527,18 @@ class SimpleDP3(BasePolicy):
             t_current: (B,)
             r_n: (B,)
             ground_truth: (B,T,Da), 真实动作（专家演示）
-            t_min: float
+            t_min: (B,)
         returns:
-            reward: float
+            reward: [B,] 每个样本一个reward
         """
         #动作质量奖励
-        mse = F.mse_loss(trajectory,ground_truth,reduction='mean')
-        r_quality = -mse.item()
+        # mse = F.mse_loss(trajectory,ground_truth,reduction='mean') #标量张量
+        mse=F.mse_loss(trajectory,ground_truth,reduction='none').mean(dim=(1,2)) #[B]
+        r_quality = -mse
         #效率奖励
-        r_efficiency = torch.log(r_n+1e-8).mean().item()
+        r_efficiency = torch.log(r_n+1e-8)
         #终止奖励
-        r_terminal = 1.0 if (t_current < t_min).all() else 0.0
+        r_terminal = torch.where(t_current < t_min, 1.0, 0.0)
         #综合奖励
         w1,w2,w3 = 1.0,0.1,1.0
         reward = w1*r_quality + w2*r_efficiency +w3*r_terminal
@@ -485,7 +547,7 @@ class SimpleDP3(BasePolicy):
     def train_tpm_with_ppo(self,
                            dataset,
                            num_epochs=200,
-                           batch_size=256,
+                           batch_size=128, #256,
                            learning_rate=1e-5,
                            gamma=0.99,
                            clip_eps=0.2,
@@ -503,6 +565,21 @@ class SimpleDP3(BasePolicy):
             value_loss_coef: float, 价值损失权重
             entrepy_coef: float, 熵正则化权重
         """
+        import time
+        timestep=time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        tpm_checkpoint_dir=os.path.join("checkpoints/tpm",f"tpm_{timestep}")
+        os.makedirs(tpm_checkpoint_dir, exist_ok=True)
+        epoch_metrics = {
+            'loss': [],
+            'r_n': [],
+            'r_n_mean': [],
+            'step_counts': [],
+            't_current': [],
+            'reward_mean': [],
+            'alpha_mean': [],
+            'beta_mean': [],
+        }
+
         #冻结ConditionalUnet1D和obs_encoder
         self.model.eval()
         self.obs_encoder.eval()
@@ -530,24 +607,34 @@ class SimpleDP3(BasePolicy):
         #critic_optimizer=optim.AdamW(critic.parameters(),lr=learning_rate,betas=[0.9,0.99])
 
         ##如果dataset是dataloader，直接使用；否则列表切片
-        if isinstance(dataset,DataLoader):
-            data_iter = iter(dataset)
-        else:
-            data_iter = None
+        # if isinstance(dataset,DataLoader):
+        #     data_iter = None
+        # else:
+        #     data_iter = iter(dataset)
+
+        # print(f"DataLoader batch_size: {dataset.batch_size}")
+        # print(f"Dataset length: {len(dataset)}")
 
         #ppo训练循环
         for epoch in range(num_epochs):
-            #收集轨迹
-            states=[]
-            actions=[]
-            log_probs=[]
-            rewards=[]
-            values=[]
-            dones=[]
+            all_states = []
+            all_actions = []
+            all_log_probs = []
+            all_rewards = []
+            all_values = []
+            all_dones = []
+            batch_sizes = []
+            batch_step_counts = [] #记录实际去噪步数
+            batch_losses = []
+            batch_r_n = []
+            batch_rewards = []
+            batch_alpha = []
+            batch_beta = []
 
             if isinstance(dataset,DataLoader):
                 #使用dataloader迭代
-                for batch in dataset:
+                for batch_idx, batch in enumerate(dataset):
+
                     batch = dict_apply(batch,lambda x: x.to(self.device,non_blocking=True))
                     nobs = self.normalizer.normalize(batch['obs']) #归一化观测
                     nactions = self.normalizer['action'].normalize(batch['action']) #归一化真实动作
@@ -555,16 +642,17 @@ class SimpleDP3(BasePolicy):
                     if not self.use_pc_color:
                         nobs['point_cloud'] = nobs['point_cloud'][...,:3]
 
-                    print(nactions.shape)
                     batch_size = nactions.shape[0]
                     horizon = nactions.shape[1]
+                    batch_sizes.append(batch_size)
+                    step_counts=torch.zeros(batch_size,dtype=torch.int,device=self.device) #每个batch的步数
 
                     local_cond = None
                     global_cond = None
-                    trajectory = nactions
-                    cond_data = trajectory
+                    #trajectory = nactions
+                    #cond_data = trajectory
 
-                        #=== same with predict_action ===#
+                    #=== same with predict_action ===#
                     if self.obs_as_global_cond:
                         this_nobs = dict_apply(nobs,
                         lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
@@ -581,219 +669,265 @@ class SimpleDP3(BasePolicy):
                     #去噪过程   #====be similar to conditional_sample===#
                     trajectory = torch.randn_like(cond_data)
                     t_current = torch.ones((batch_size,),device=self.device)
-                    t_min = 0.01
+                    t_min = torch.full_like(t_current,0.1)
                     step=0
+                    active_mask = torch.ones((batch_size,),device=self.device,dtype=torch.bool)
 
-                    while(t_current > t_min).any() and step < self.max_inference_steps:
+                    #按样本存储轨迹，而不是按步存储
+                    sample_states = [[] for _ in range(batch_size)] #每个样本的状态
+                    sample_actions = [[] for _ in range(batch_size)] #每个样本的动作
+                    sample_log_probs = [[] for _ in range(batch_size)] #每个样本的log_prob
+                    sample_values = [[] for _ in range(batch_size)] #每个样本的价值
+                    sample_rewards = [[] for _ in range(batch_size)] #每个样本的奖励
+                    sample_dones = [[] for _ in range(batch_size)] #每个样本的终止标志
+
+                    batch_r_n_temp = []
+                    batch_alpha_temp = []
+                    batch_beta_temp = []
+                    batch_rewards_temp = []
+
+                    while active_mask.any() and step < self.max_inference_steps:
                         trajectory[cond_mask] = cond_data[cond_mask]
 
                         with torch.no_grad():
-                            time_embed = self.model.time_mlp(self.model.timestep_embedding(t_current)) #(B,256)
+                            active_indices = torch.where(active_mask)[0]
+                            active_trajectory = trajectory[active_indices]  # (B', T, D)
+                            time_embed = self.model.time_mlp(self.model.timestep_embedding(t_current[active_indices])) #(B,128)
                             features_before,features_after = self.model.get_intermediate_features(
-                                sample=trajectory, 
-                                timestep=t_current, 
-                                local_cond=local_cond, 
-                                global_cond=global_cond, 
+                                sample=active_trajectory, 
+                                timestep=t_current[active_indices], 
+                                local_cond=None if local_cond is None else local_cond[active_indices],
+                                global_cond=None if global_cond is None else global_cond[active_indices]
                             )
-                        
-                        features = torch.cat([features_before,features_after],dim=1)
+                        features = torch.cat([features_before,features_after],dim=1) #(B,1280,4)
 
                         #tpm预测r_n
                         r_n,(alpha,beta)=self.tpm(features,time_embed)
 
                         ##计算动作的对数概率
                         beta_dist=Beta(alpha,beta)
-                        log_prob=beta_dist.log_prob(r_n).sum()
+                        log_prob=beta_dist.log_prob(r_n).detach() #B
 
                         ##状态=特征+时间嵌入
-                        state=torch.cat([features,time_embed.unsqueeze(-1)],dim=1)
+                        state=torch.cat([features,time_embed.unsqueeze(-1).expand(-1,-1,features.shape[-1])],dim=1)
 
                         ##价值估计
                         with torch.no_grad():
-                            value=critic(features)
-
-                        ##存储
-                        states.append(state)
-                        actions.append(r_n)
-                        log_probs.append(log_prob)
-                        values.append(value)
+                            value=critic(features) #[B,1]
 
                         #更新时间步
-                        t_next=r_n*t_current
-                        
-                        #使用ddim计算前一步
-                        model_output = self.model(sample=trajectory,
-                                                timestep=t_current, 
-                                                local_cond=local_cond,
-                                                global_cond=global_cond)                                     
+                        t_next=r_n*t_current[active_indices]
+                        if t_current[0]==1:
+                            t_current=t_next
+                            t_next=r_n*t_current
 
-                        #自定义实现ddim
-                        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(trajectory.device)
-                        alpha_t=self.noise_scheduler.alphas_cumprod[t_current.long()]
-                        alpha_t_prev=self.noise_scheduler.alphas_cumprod[t_next.long()]
+                        batch_r_n_temp.append(r_n.cpu().numpy())
+                        batch_alpha_temp.append(alpha.detach().cpu().numpy())
+                        batch_beta_temp.append(beta.detach().cpu().numpy())
 
-                        trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
-                        
-                        ##计算奖励
-                        reward=self.compute_tpm_reward(trajectory,t_current,r_n,nactions,t_min)
-                        rewards.append(reward)
+                        #按样本索引存储数据
+                        for idx, active_index in enumerate(active_indices):
+                            sample_states[active_index].append(state[idx].unsqueeze(0))  # [1,1408,4]
+                            sample_actions[active_index].append(r_n[idx].unsqueeze(0))  # [1,]
+                            sample_log_probs[active_index].append(log_prob[idx].unsqueeze(0))  # [1,]
+                            sample_values[active_index].append(value[idx].unsqueeze(0))  # [1,1]
+                            model_output = self.model(sample=active_trajectory[idx].unsqueeze(0),
+                                                    timestep=t_current[active_index].unsqueeze(0), 
+                                                    local_cond=None if local_cond is None else local_cond[active_index].unsqueeze(0),
+                                                    global_cond=None if global_cond is None else global_cond[active_index].unsqueeze(0))
+                            
+                            #自定义实现ddim
+                            self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(trajectory.device)
+                            alpha_t=self.noise_scheduler.alphas_cumprod[torch.floor(100*t_current[active_index]).long()]
+                            alpha_t_prev=self.noise_scheduler.alphas_cumprod[torch.floor(100*t_next[idx]).long()]
+                            alpha_t_prev=alpha_t_prev.view(1,1,1)
 
-                        ##终止标志
-                        done=(t_current<t_min).all() or (step>=self.num_inference_steps-1)
-                        dones.append(done)
-                        
-                        t_current=t_next
-                        step+=1
+                            if self.noise_scheduler.config.prediction_type == 'epsilon':
+                                x0_pred = (trajectory[active_index].unsqueeze(0) - torch.sqrt(1 - alpha_t_prev) * model_output) / torch.sqrt(alpha_t_prev)
+                            else:
+                                x0_pred = model_output
+
+                            # Clip "predicted x_0"
+                            if self.noise_scheduler.config.clip_sample:
+                                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+                            trajectory[active_index] = torch.sqrt(alpha_t_prev)*x0_pred+torch.sqrt(1-alpha_t_prev)*model_output
+                            reward=self.compute_tpm_reward(trajectory[active_index].unsqueeze(0),t_current[active_index].unsqueeze(0),r_n[idx].unsqueeze(0),nactions[active_index].unsqueeze(0),t_min[active_index].unsqueeze(0)) #[B]
+                            batch_rewards_temp.append(reward.cpu().numpy().item())
+                            sample_rewards[active_index].append(reward.unsqueeze(0))  # [B]
+                            done=(t_current[active_index]<t_min[active_index]) | (step>=self.max_inference_steps-1) #[B]
+                            sample_dones[active_index].append(done.unsqueeze(0))  # [B]
+
+                        t_current[active_indices] = t_next
+                        active_mask = ~torch.tensor([any(dones_i) for dones_i in sample_dones], device=self.device, dtype=torch.bool)  # 更新活跃掩码
+                        step_counts[active_indices] += 1
+
+                        step += 1
+                    
+                    #记录该batch步数step
+                    batch_step_counts.append(step_counts.tolist())  #step_counts[128]
+                    # print("batch_step_counts",batch_step_counts)
+                    batch_r_n.append(np.concatenate(batch_r_n_temp) if batch_r_n_temp else np.array([]))
+                    batch_alpha.append(np.concatenate(batch_alpha_temp) if batch_alpha_temp else np.array([]))
+                    batch_beta.append(np.concatenate(batch_beta_temp) if batch_beta_temp else np.array([]))
+                    batch_rewards.append(np.array(batch_rewards_temp) if batch_rewards_temp else np.array([]))
+
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: "
+                            f"Step Counts Mean: {np.mean(step_counts.cpu().numpy()):.2f}, "
+                            # f"Step Counts Std: {np.std(step_counts.cpu().numpy()):.2f}, "
+                            f"r_n Mean: {np.mean(batch_r_n[-1]):.4f}, "
+                            # f"r_n Std: {np.std(batch_r_n[-1]):.4f}, "
+                            f"Reward Mean: {np.mean(batch_rewards[-1]):.4f}, "
+                            f"Alpha Mean: {alpha.mean().item():.4f}, "
+                            f"Beta Mean: {beta.mean().item():.4f}"
+                            )
+
+                    #将每个样本的轨迹拼接成tensor
+                    for i in range(batch_size): #[128]
+                        sample_states[i] = torch.cat(sample_states[i], dim=0) if sample_states[i] else torch.zeros((0, 1408, 4), device=self.device) #[k,1408,4]
+                        sample_actions[i] = torch.cat(sample_actions[i], dim=0) if sample_actions[i] else torch.zeros((0,), device=self.device) #[k]
+                        sample_log_probs[i] = torch.cat(sample_log_probs[i], dim=0) if sample_log_probs[i] else torch.zeros((0,), device=self.device) #[k]
+                        sample_values[i] = torch.cat(sample_values[i], dim=0) if sample_values[i] else torch.zeros((0, 1), device=self.device) #[k,1]
+                        sample_rewards[i] = torch.cat(sample_rewards[i], dim=0) if sample_rewards[i] else torch.zeros((0,), device=self.device) #[k,1]
+                        sample_dones[i] = torch.cat(sample_dones[i], dim=0) if sample_dones[i] else torch.zeros((0,), device=self.device) #[k]
+
+                    #存储到all_states
+                    all_states.append(sample_states)
+                    all_actions.append(sample_actions)
+                    all_log_probs.append(sample_log_probs)
+                    all_values.append(sample_values)
+                    all_rewards.append(sample_rewards)
+                    all_dones.append(sample_dones)
+                    # all_states.append(sample_states if sample_states[0].numel() else torch.zeros((0, 1408, 4), device=self.device)) #batch*[128]
+                    # all_actions.append(sample_actions if sample_actions[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_log_probs.append(sample_log_probs if sample_log_probs[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_values.append(sample_values if sample_values[0].numel() else torch.zeros((batch_size, 0, 1), device=self.device))
+                    # all_rewards.append(sample_rewards if sample_rewards[0].numel() else torch.zeros((batch_size, 0), device=self.device))
+                    # all_dones.append(sample_dones if sample_dones[0].numel() else torch.zeros((batch_size, 0), dtype=torch.bool, device=self.device))
 
             else:
-                #按批次切片
-                for batch_idx in range(0,len(dataset),batch_size):
-                    #=== same with compute_loss ===#
-                    batch = dataset[batch_idx:batch_idx+batch_size]
-                    nobs = self.normalizer.normalize(batch['obs']) #归一化观测
-                    nactions = self.normalizer['action'].normalize(batch['action']) #归一化真实动作
-                    
-                    if not self.use_pc_color:
-                        nobs['point_cloud'] = nobs['point_cloud'][...,:3]
+                print("dataloader method change...")
 
-                    print(nactions.shape)
-                    batch_size = nactions.shape[0]
-                    horizon = nactions.shape[1]
+            #=========数据收集完毕，进入策略和价值网络优化更新===========#
+            for _ in range(5):
+                for batch_idx in range(len(batch_sizes)):
+                    batch_size=batch_sizes[batch_idx]
+                    batch_step=batch_step_counts[batch_idx]
 
-                    local_cond = None
-                    global_cond = None
-                    trajectory = nactions
-                    cond_data = trajectory
+                    # start_idx=batch_idx*max_steps
+                    # end_idx=(batch_idx+1)*max_steps
 
-                        #=== same with predict_action ===#
-                    if self.obs_as_global_cond:
-                        this_nobs = dict_apply(nobs,
-                        lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
-                        nobs_features = self.obs_encoder(this_nobs)
-                        if "cross_attention" in self.condition_type:
-                            global_cond = nobs_features.reshape(batch_size,self.n_obs_steps,-1)
-                        else:
-                            global_cond = nobs_features.reshape(batch_size,-1)
-                    #=== same with compute_loss ===#
+                    batch_states=all_states[batch_idx] #128*[step, 1408, 4]
+                    batch_actions=all_actions[batch_idx]
+                    batch_log_probs=all_log_probs[batch_idx] #128*[step]
+                    batch_values=all_values[batch_idx] #128*[step,1]
+                    batch_rewards=all_rewards[batch_idx] #128*[k,1]
+                    batch_dones=all_dones[batch_idx] #128*[k]
 
-                    cond_data = torch.zeros(size=(batch_size,self.horizon,self.action_dim),device=self.device,dtype=nactions.dtype)
-                    cond_mask = torch.zeros_like(cond_data,dtype=torch.bool)
+                    # batch_returns=[]
+                    # batch_advantages=[]
 
-                    #去噪过程   #====be similar to conditional_sample===#
-                    trajectory = torch.randn_like(cond_data)
-                    t_current = torch.ones((batch_size,),device=self.device)
-                    t_min = 0.01
-                    step=0
+                    for i in range(batch_size):
+                        step_count=batch_step[i]
+                        if step_count == 0:
+                            continue
+                        values_i=batch_values[i][:step_count]
+                        state_i=batch_states[i][:step_count]
+                        log_probs_i=batch_log_probs[i][:step_count]
 
-                    while(t_current > t_min).any() and step < self.max_inference_steps:
-                        trajectory[cond_mask] = cond_data[cond_mask]
+                        #计算回报和优势
+                        G=torch.zeros((1,),device=self.device)
+                        returns_i=[]
+                        for s in range(step_count):
+                            r=batch_rewards[i][s]
+                            d=batch_dones[i][s]
+                            G=torch.where(d,torch.zeros_like(G),G)
+                            G=r+gamma*G
+                            returns_i.append(G)
+                        returns_i=torch.stack(returns_i)
+                        # batch_returns.append(returns_i)  # [step_count, 1]
+                        advantages_i=returns_i-values_i
+                        if advantages_i.numel()>1:
+                            advantages_i=(advantages_i-advantages_i.mean()) / (advantages_i.std()+1e-8)
+                        # batch_advantages.append(advantages_i)
 
-                        with torch.no_grad():
-                            time_embed = self.model.time_mlp(self.model.timestep_embedding(t_current)) #(B,256)
-                            features_before,features_after = self.model.get_intermediate_features(
-                                sample=trajectory, 
-                                timestep=t_current, 
-                                local_cond=local_cond, 
-                                global_cond=global_cond, 
-                            )
-                        
-                        features = torch.cat([features_before,features_after],dim=1)
+                        #PPO更新
+                        features=state_i[:,:-128,:].clone()
+                        time_embed=state_i[:,-128:,0].squeeze(-1).clone()
 
-                        #tpm预测r_n
                         r_n,(alpha,beta)=self.tpm(features,time_embed)
-
-                        ##计算动作的对数概率
                         beta_dist=Beta(alpha,beta)
-                        log_prob=beta_dist.log_prob(r_n).sum()
+                        new_log_probs=beta_dist.log_prob(r_n) #[step,1]
 
-                        ##状态=特征+时间嵌入
-                        state=torch.cat([features,time_embed.unsqueeze(-1)],dim=1)
+                        value_pred=critic(features) #[step,1]
 
-                        ##价值估计
-                        with torch.no_grad():
-                            value=critic(features)
+                        #计算ppo损失
+                        ratio=torch.exp(new_log_probs-log_probs_i)
+                        surr1=ratio*advantages_i
+                        surr2=torch.clamp(ratio,1-clip_eps,1+clip_eps)*advantages_i
+                        policy_loss=-torch.min(surr1,surr2).mean()
+                        value_loss=F.mse_loss(value_pred,returns_i)
+                        entropy=beta_dist.entropy().mean()
+                        loss=policy_loss+value_loss_coef*value_loss-entropy_coef*entropy
 
-                        ##存储
-                        states.append(state)
-                        actions.append(r_n)
-                        log_probs.append(log_prob)
-                        values.append(value)
+                        #更新参数
+                        optimizer.zero_grad()
+                        critic_optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        critic_optimizer.step()
 
-                        #更新时间步
-                        t_next=r_n*t_current
+                        batch_losses.append(loss.item())
                         
-                        #使用ddim计算前一步
-                        model_output = self.model(sample=trajectory,
-                                                timestep=t_current, 
-                                                local_cond=local_cond,
-                                                global_cond=global_cond)                                     
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx+1}: "
+                                f"PPO Loss: {np.mean(batch_losses):.4f}")
+            # print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+        
+            epoch_metrics['loss'].append(np.mean(batch_losses))
+            epoch_metrics['r_n_mean'].append(np.mean([b.mean() for b in batch_r_n if len(b) > 0]))
+            # epoch_metrics['r_n_std'].append(np.mean([b.std() for b in batch_r_n if len(b) > 0]))
+            # epoch_metrics['reward_mean'].append(np.mean([b.mean() for b in batch_rewards if len(b) > 0]))
+            epoch_metrics['step_counts'].append(np.mean(batch_step_counts))
+            epoch_metrics['alpha_mean'].append(np.mean([b.mean() for b in batch_alpha if len(b) > 0]))
+            epoch_metrics['beta_mean'].append(np.mean([b.mean() for b in batch_beta if len(b) > 0]))
 
-                        #自定义实现ddim
-                        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(trajectory.device)
-                        alpha_t=self.noise_scheduler.alphas_cumprod[t_current.long()]
-                        alpha_t_prev=self.noise_scheduler.alphas_cumprod[t_next.long()]
+            # 计算当前epoch的平均loss
+            min_loss_threshold=1e-6
+            current_loss = np.mean(batch_losses)
+            if current_loss < min_loss_threshold:
+                logger.info(f"Early stopping: Loss {current_loss:.6f} below threshold {min_loss_threshold}")
+                break
 
-                        trajectory = torch.sqrt(alpha_t_prev)*model_output+torch.sqrt(1-alpha_t_prev)*model_output
-                        
-                        ##计算奖励
-                        reward=self.compute_tpm_reward(trajectory,t_current,r_n,nactions,t_min)
-                        rewards.append(reward)
+            logger.info(f"Epoch {epoch+1}/{num_epochs} Summary: "
+                       f"Loss: {np.mean(batch_losses):.4f}, "
+                       f"r_n Mean: {epoch_metrics['r_n_mean'][-1]:.4f}, "
+                       f"Step Counts Mean: {np.mean(batch_step_counts):.2f}, "
+                    #    f"r_n Std: {epoch_metrics['r_n_std'][-1]:.4f}, "
+                    #    f"Reward Mean: {epoch_metrics['reward_mean'][-1]:.4f}, "
+                       f"Alpha Mean: {epoch_metrics['alpha_mean'][-1]:.4f}, "
+                       f"Beta Mean: {epoch_metrics['beta_mean'][-1]:.4f}")
 
-                        ##终止标志
-                        done=(t_current<t_min).all() or (step>=self.num_inference_steps-1)
-                        dones.append(done)
-                        
-                        t_current=t_next
-                        step+=1
             
-            ##计算回报和优势
-            returns =[]
-            advantages = []
-            G=0
-            for r,d in zip(reversed(reward),reversed(done)):
-                if d:
-                    G=0
-                G=r+gamma*G
-                returns.insert(0,G)
+            if (epoch + 1) % 5 == 0:
+                #保存模型
+                # tpm_checkpoint_path = f"checkpoints/tpm/tpm_epoch_{epoch+1}.pt"
+                tpm_checkpoint_path = os.path.join(tpm_checkpoint_dir, f"tpm_epoch_{epoch+1}.pt")
+                torch.save(self.tpm.state_dict(), tpm_checkpoint_path)
+                logger.info(f"Saved TPM checkpoint to {tpm_checkpoint_path}")
+            # np.save(f'tpm_metrics_epoch_{epoch+1}.npy', epoch_metrics)
 
-            returns=torch.tensor(returns,device=self.device)
-            values=torch.cat(values).squeeze()
+                complete_model_path = os.path.join(tpm_checkpoint_dir, f"complete_epoch_{epoch+1}.pt")
+                complete_state = {
+                    'model': self.model.state_dict(),
+                    'tpm': self.tpm.state_dict(),
+                    # 'optimizer': optimizer.state_dict(),
+                    # 'critic_optimizer': critic_optimizer.state_dict(),
+                    'epoch': epoch + 1,
+                    # 'batch_idx': batch_idx + 1,
+                    'epoch_metrics': epoch_metrics
+                }
+                torch.save(complete_state, complete_model_path)
+                logger.info(f"Saved complete model checkpoint to {complete_model_path}")
 
-            ##标准化优势
-            advantages=(returns-advantages.mean()) / (advantages.std()+1e-8)
-
-            ##ppo更新
-            states=torch.stack(states)
-            actions=torch.stack(actions)
-            old_log_probs=torch.stack(log_probs)
-
-            for _ in range(10): #ppo更新多次
-                ##重新计算策略和价值
-                features=states[:,:-256,:] #去掉time_embed部分
-                time_embed=states[:,-256:,:] #time_embed部分 time_embed:(B,256)
-                time_embed=time_embed.squeeze(-1)
-                r_n,(alpha,beta)=self.tpm(features,time_embed)
-                beta_dist=Beta(alpha,beta)
-                new_log_probs=beta_dist.log_prob(r_n).sum()
-
-                value_pred=critic(features).squeeze()
-
-                ##计算ppo损失
-                ratio = torch.exp(new_log_probs-old_log_probs)
-                surr1=ratio*advantages
-                surr2=torch.clamp(ratio,1-clip_eps,1+clip_eps)*advantages
-                policy_loss=-torch.min(surr1,surr2).mean()
-
-                value_loss=F.mse_loss(value_pred,returns)
-
-                entropy=beta_dist.entropy().mean()
-                loss=policy_loss + value_loss_coef*value_loss - entropy_coef*entropy
-
-                ##更新参数
-                optimizer.zero_grad()
-                critic_optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                critic_optimizer.step()
-
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+        logger.info("TPM training completed.")
+        return epoch_metrics
