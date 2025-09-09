@@ -117,6 +117,7 @@ class ConditionalUnet1D(nn.Module):
         use_up_condition=True,
         ):
         super().__init__()
+        print(f"down_dims: {down_dims}")
         self.condition_type = condition_type
         
         self.use_down_condition = use_down_condition
@@ -124,15 +125,23 @@ class ConditionalUnet1D(nn.Module):
         self.use_up_condition = use_up_condition
         
         all_dims = [input_dim] + list(down_dims)
+        print(f"all_dims: {all_dims}")
         start_dim = down_dims[0]
 
         dsed = diffusion_step_embed_dim
-        diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed),
+        #拆分 diffusion_step_encoder
+        self.positonal_embedding = SinusoidalPosEmb(dsed)
+        self.time_mlp = nn.Sequential(
             nn.Linear(dsed, dsed * 4),
             nn.Mish(),
             nn.Linear(dsed * 4, dsed),
         )
+        #兼容旧代码
+        self.diffusion_step_encoder = nn.Sequential(
+            self.positonal_embedding,
+            self.time_mlp
+        )
+
         cond_dim = dsed
         if global_cond_dim is not None:
             cond_dim += global_cond_dim
@@ -205,8 +214,6 @@ class ConditionalUnet1D(nn.Module):
             nn.Conv1d(start_dim, input_dim, 1),
         )
         
-
-        self.diffusion_step_encoder = diffusion_step_encoder
         self.local_cond_encoder = local_cond_encoder
         self.up_modules = up_modules
         self.down_modules = down_modules
@@ -215,11 +222,96 @@ class ConditionalUnet1D(nn.Module):
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
         print_params(self)
 
+    def timestep_embedding(self,timestep:Union[torch.tensor,float,int]) -> torch.tensor:
+        """
+        获取时间步的初始嵌入（正弦位置编码SinusoidalPosEmb的输出）
+        Args:
+            timestep(B,)
+        return:
+            embedding(B,D:diffusion_step_embed_dim)
+        """
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep],dtype=torch.long,device=self.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(self.device)
+        #广播到批次维度
+        timestep = timestep.expand(timestep.shape[0])
+
+        return self.positonal_embedding(timestep)
+
+    def get_intermediate_features(self,
+                                  sample:torch.tensor,
+                                  timestep:Union[torch.tensor,float,int],
+                                  local_cond=None,
+                                  global_cond=None):
+        """
+        提取中间特征
+
+        """
+        sample = einops.rearrange(sample, 'b h t -> b t h')
+
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+
+        timestep_embed = self.diffusion_step_encoder(timesteps)
+        if global_cond is not None:
+            global_feature = torch.cat([timestep_embed, global_cond], axis=-1)
+
+
+        # encode local features
+        h_local = list()
+        if local_cond is not None:
+            local_cond = einops.rearrange(local_cond, 'b h t -> b t h')
+            resnet, resnet2 = self.local_cond_encoder
+            x = resnet(local_cond, global_feature)
+            h_local.append(x)
+            x = resnet2(local_cond, global_feature)
+            h_local.append(x)
+        
+        x = sample
+        h = []
+        features_before=None
+        for idx, (resnet, downsample) in enumerate(self.down_modules):
+            if self.use_down_condition:
+                x = resnet(x, global_feature)
+                if idx == 0:
+                    features_before=x
+                    if len(h_local) > 0:
+                        x = x + h_local[0]
+            else:
+                x = resnet(x)
+                if idx == 0:
+                    features_before=x
+                    if len(h_local) > 0:
+                        x = x + h_local[0]
+                x = resnet2(x)
+            h.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            if self.use_mid_condition:
+                x = mid_module(x, global_feature)
+                # print(f'mid1: {x.shape}')
+            else:
+                x = mid_module(x)
+
+        features_after=x
+
+        return features_before,features_after
 
     def forward(self, 
             sample: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
-            local_cond=None, global_cond=None, **kwargs):
+            local_cond=None, 
+            global_cond=None,
+            **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
@@ -279,7 +371,6 @@ class ConditionalUnet1D(nn.Module):
                 # print(f'mid1: {x.shape}')
             else:
                 x = mid_module(x)
-
 
         for idx, (resnet, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
